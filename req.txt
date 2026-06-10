@@ -1,0 +1,13 @@
+APScheduler==3.11.2
+asgiref==3.11.1
+certifi==2026.5.20
+charset-normalizer==3.4.7
+Django==6.0.6
+idna==3.18
+psycopg2-binary==2.9.12
+python-dotenv==1.2.2
+requests==2.34.2
+sqlparse==0.5.5
+tzdata==2026.2
+tzlocal==5.3.1
+urllib3==2.7.0
