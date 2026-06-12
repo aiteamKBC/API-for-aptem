@@ -306,24 +306,45 @@ def _map_user(u):
     target_comp_pct = f"{round(expected_pct)}%" if expected_pct is not None else None
     completed_comp_pct = f"{round(actual_pct)}%" if actual_pct is not None else None
     if actual_pct is not None and expected_pct is not None:
-        progress_variance = f"{round(actual_pct - expected_pct):+d}%"
         comp_status = "On Track" if actual_pct >= expected_pct else "Behind"
     else:
-        progress_variance = None
         comp_status = None
 
-    # Progress-Hours = completed off-the-job hours minus planned hours, "Xh Ym".
     completed_min = safe_numeric(u.get("UserLearningPlanSummary_CompletedTime"))
+    submitted_min = safe_numeric(u.get("UserLearningPlanSummary_SubmittedTime"))
+    forecast_min = safe_numeric(u.get("UserLearningPlanSummary_ForecastTime"))
+    expected_min = safe_numeric(u.get("UserLearningPlanSummary_ExpectedOffTheJobHours"))
     planned_hours = safe_numeric(u.get("UserILRSummary_PlannedHours"))
-    if completed_min is not None and planned_hours is not None:
-        diff_min = round(completed_min - planned_hours * 60)
-        sign = "-" if diff_min < 0 else ""
-        progress_hours = f"{sign}{abs(diff_min) // 60}h {abs(diff_min) % 60}m"
-    else:
-        progress_hours = None
 
     on_time = u.get("UserLearningPlanSummary_OnTime")
     otj_status = ("On Track" if on_time else "Behind") if on_time is not None else None
+
+    # --- OTJ hours progress (mirrors Hours_formating.js logic) ---
+    # planned_hours and completed_min already computed above.
+    # elapsed_days / total_days already computed above.
+    _planned_h = planned_hours or 0.0
+    _completed_h = (completed_min or 0.0) / 60.0
+    _target_ratio = (
+        min(elapsed_days, total_days) / total_days
+        if total_days and total_days > 0 and elapsed_days is not None
+        else None
+    )
+    if _planned_h > 0 and _target_ratio is not None:
+        _completed_pct = (_completed_h / _planned_h) * 100.0
+        otj_overall_progress = round(_completed_pct - _target_ratio * 100.0)
+    else:
+        otj_overall_progress = None
+
+    otj_overall_progress_text = f"{otj_overall_progress}%" if otj_overall_progress is not None else None
+
+    if _target_ratio is not None:
+        _target_min = _planned_h * 60.0 * _target_ratio
+        _variance_min = round((completed_min or 0.0) - _target_min)
+        _sign = "-" if _variance_min < 0 else ""
+        _abs = abs(_variance_min)
+        otj_overall_variance = f"{_sign}{_abs // 60}h {_abs % 60}m"
+    else:
+        otj_overall_variance = None
 
     return (
         safe_int(u.get("Id")),
@@ -331,12 +352,12 @@ def _map_user(u):
         u.get("Email"),
         safe_numeric(u.get("UserILRSummary_MinimumRequiredHours")),
         safe_numeric(u.get("UserILRSummary_PlannedHours")),
-        safe_numeric(u.get("UserLearningPlanSummary_SubmittedTime")),
-        safe_numeric(u.get("UserLearningPlanSummary_CompletedTime")),
-        safe_numeric(u.get("UserLearningPlanSummary_ForecastTime")),
-        safe_numeric(u.get("UserLearningPlanSummary_ExpectedOffTheJobHours")),
-        progress_variance,  # ProgressVariance
-        progress_hours,  # Progress-Hours
+        int(submitted_min // 60) if submitted_min is not None else None,
+        int(completed_min // 60) if completed_min is not None else None,
+        int(forecast_min // 60) if forecast_min is not None else None,
+        int(expected_min // 60) if expected_min is not None else None,
+        otj_overall_progress_text,  # ProgressVariance
+        otj_overall_variance,  # Progress-Hours
         otj_status,  # OTJHoursStatus
         total_target_ksb,  # TotalTargetKSB
         total_completed_ksb,  # TotalCompletedKSB
