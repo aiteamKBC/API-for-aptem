@@ -269,6 +269,7 @@ def _map_user(u):
         ksb_status = "In Progress"
     else:
         ksb_status = "Not Started"
+        
 
     # --- Component names, completed counts & actual hours per evidence bucket,
     #     aggregated from the LearningPlanComponents entity set by LearnerId. ---
