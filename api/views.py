@@ -342,20 +342,12 @@ def _map_user(u):
     else:
         otj_overall_variance = None
 
-    # OTJHoursStatus based on OTJ-specific fields (ExpectedOffTheJobHours vs SubmittedTime)
-    _otj_planned_h = (expected_min or 0.0) / 60.0
-    _otj_completed_h = (submitted_min or 0.0) / 60.0
-    if _otj_planned_h > 0 and _target_ratio is not None:
-        _otj_completed_pct = (_otj_completed_h / _otj_planned_h) * 100.0
-        _otj_progress = round(_otj_completed_pct - _target_ratio * 100.0)
-    else:
-        _otj_progress = None
-
-    if _otj_progress is None:
+    # OTJHoursStatus follows the same progress variance logic used in n8n.
+    if otj_overall_progress is None:
         otj_status = None
-    elif _otj_progress >= -10:
+    elif otj_overall_progress >= -10:
         otj_status = "On Track"
-    elif _otj_progress >= -25:
+    elif otj_overall_progress >= -25:
         otj_status = "Need Attention"
     else:
         otj_status = "At Risk"
