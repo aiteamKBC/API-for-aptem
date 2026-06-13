@@ -315,14 +315,9 @@ def _map_user(u):
     submitted_min = safe_numeric(u.get("UserLearningPlanSummary_SubmittedTime"))
     forecast_min = safe_numeric(u.get("UserLearningPlanSummary_ForecastTime"))
     expected_min = safe_numeric(u.get("UserLearningPlanSummary_ExpectedOffTheJobHours"))
-    planned_hours = safe_numeric(u.get("UserILRSummary_PlannedHours"))
-
-    on_time = u.get("UserLearningPlanSummary_OnTime")
-    otj_status = ("On Track" if on_time else "Behind") if on_time is not None else None
 
     # --- OTJ hours progress (mirrors Hours_formating.js logic) ---
-    # planned_hours and completed_min already computed above.
-    # elapsed_days / total_days already computed above.
+    planned_hours = safe_numeric(u.get("UserILRSummary_PlannedHours"))
     _planned_h = planned_hours or 0.0
     _completed_h = (completed_min or 0.0) / 60.0
     _target_ratio = (
@@ -346,6 +341,24 @@ def _map_user(u):
         otj_overall_variance = f"{_sign}{_abs // 60}h {_abs % 60}m"
     else:
         otj_overall_variance = None
+
+    # OTJHoursStatus based on OTJ-specific fields (ExpectedOffTheJobHours vs SubmittedTime)
+    _otj_planned_h = (expected_min or 0.0) / 60.0
+    _otj_completed_h = (submitted_min or 0.0) / 60.0
+    if _otj_planned_h > 0 and _target_ratio is not None:
+        _otj_completed_pct = (_otj_completed_h / _otj_planned_h) * 100.0
+        _otj_progress = round(_otj_completed_pct - _target_ratio * 100.0)
+    else:
+        _otj_progress = None
+
+    if _otj_progress is None:
+        otj_status = None
+    elif _otj_progress >= -10:
+        otj_status = "On Track"
+    elif _otj_progress >= -25:
+        otj_status = "Need Attention"
+    else:
+        otj_status = "At Risk"
 
     return (
         safe_int(u.get("Id")),
