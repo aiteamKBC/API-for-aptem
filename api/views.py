@@ -241,7 +241,8 @@ def _map_user(u):
     # --- Sub-programmes & markers (merged via the EXPAND_URL pass) ---
     subprograms = u.get("UserProgram_SubPrograms") or []
     markers = u.get("Markers_Markers") or []
-    subprogram_names = "; ".join(s.get("Name") for s in subprograms if s.get("Name")) or None
+    subprogram_name_list = [s.get("Name") for s in subprograms if s.get("Name")]
+    subprogram_names = json.dumps(subprogram_name_list) if subprogram_name_list else None
     marker_names = "; ".join(m.get("Name") for m in markers if m.get("Name")) or None
 
     # --- KSB coverage from component CriteriaJson (each is a list of KSB ids) ---
