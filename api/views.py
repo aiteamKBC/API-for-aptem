@@ -12,15 +12,6 @@ load_dotenv()
 APTEM_TOKEN = os.getenv("aptem_X-API-Token")
 DATABASE_URL = os.getenv("database_string")
 
-_STATUS_FILTER = (
-    "UserProgram_Status eq 'Onboarding'"
-    " or UserProgram_Status eq 'Active'"
-    " or UserProgram_Status eq 'OnBreak'"
-    " or UserProgram_Status eq 'Withdrawn'"
-    " or UserProgram_Status eq 'UnderReview'"
-    " or UserProgram_Status eq 'ReadyToEnrol'"
-)
-
 API_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/users"
     "?$select=Id,FullName,Email,UserILRSummary_MinimumRequiredHours,"
@@ -44,7 +35,7 @@ API_URL = (
     "ComplianceDocuments_ADET_GRModel_contractforservice,"
     "ComplianceDocuments_ADET_GRModel_writtenagreement,UserGroups_GroupLevel0,"
     "UserILRSummary_EmploymentWeeklyHours,UserEmployer_LevyPayer"
-    f"&$filter=({_STATUS_FILTER}) and SubscriptionStatus eq 'FullUser'"
+    "&$filter=UserProgram_Status ne null and SubscriptionStatus eq 'FullUser'"
 )
 
 # Sub-programmes and markers only populate via $expand, and the server rejects
@@ -54,7 +45,7 @@ EXPAND_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/users"
     "?$select=Id"
     "&$expand=UserProgram_SubPrograms,Markers_Markers,UserComponents_Components"
-    f"&$filter=({_STATUS_FILTER}) and SubscriptionStatus eq 'FullUser'"
+    "&$filter=UserProgram_Status ne null and SubscriptionStatus eq 'FullUser'"
 )
 
 # Per-component detail (names, type, status, hours) comes from the
