@@ -337,9 +337,9 @@ def _map_user(u):
     # OTJHoursStatus follows the same progress variance logic used in n8n.
     if otj_overall_progress is None:
         otj_status = None
-    elif otj_overall_progress >= -10:
+    elif otj_overall_progress >= -5:
         otj_status = "On Track"
-    elif otj_overall_progress >= -25:
+    elif otj_overall_progress >= -15:
         otj_status = "Need Attention"
     else:
         otj_status = "At Risk"
