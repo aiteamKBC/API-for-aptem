@@ -317,29 +317,40 @@ def _map_user(u):
         if total_days and total_days > 0 and elapsed_days is not None
         else None
     )
-    if _planned_h > 0 and _target_ratio is not None:
-        _completed_pct = (_completed_h / _planned_h) * 100.0
-        otj_overall_progress = round(_completed_pct - _target_ratio * 100.0)
-    else:
-        otj_overall_progress = None
-
-    otj_overall_progress_text = f"{otj_overall_progress}%" if otj_overall_progress is not None else None
-
     if _target_ratio is not None:
         _target_min = _planned_h * 60.0 * _target_ratio
         _variance_min = round((completed_min or 0.0) - _target_min)
         _sign = "-" if _variance_min < 0 else ""
         _abs = abs(_variance_min)
         otj_overall_variance = f"{_sign}{_abs // 60}h {_abs % 60}m"
+
+        # Target = Completed - (Progress-Hours): the on-track OTJ target hours,
+        # formatted "Xh Ym" to mirror the Progress-Hours column.
+        _target_total_min = round(_target_min)
+        otj_target = f"{_target_total_min // 60}h {_target_total_min % 60}m"
+
+        # ProgressVariance = (Completed - Target) / Target, as a signed percent
+        # with one decimal place.
+        _target_hours = _target_min / 60.0
+        if _target_hours:
+            _progress_variance_pct = ((_completed_h - _target_hours) / _target_hours) * 100
+            otj_progress_variance = f"{_progress_variance_pct:.1f}%"
+        else:
+            _progress_variance_pct = None
+            otj_progress_variance = None
     else:
         otj_overall_variance = None
+        otj_target = None
+        otj_progress_variance = None
+        _progress_variance_pct = None
 
-    # OTJHoursStatus follows the same progress variance logic used in n8n.
-    if otj_overall_progress is None:
+    # OTJHoursStatus follows the ProgressVariance = (Completed - Target) / Target
+    # thresholds: >= -5% On Track, -15%..-5% Need Attention, < -15% At Risk.
+    if _progress_variance_pct is None:
         otj_status = None
-    elif otj_overall_progress >= -5:
+    elif _progress_variance_pct >= -5:
         otj_status = "On Track"
-    elif otj_overall_progress >= -15:
+    elif _progress_variance_pct >= -15:
         otj_status = "Need Attention"
     else:
         otj_status = "At Risk"
@@ -354,8 +365,9 @@ def _map_user(u):
         int(completed_min // 60) if completed_min is not None else None,
         int(forecast_min // 60) if forecast_min is not None else None,
         int(expected_min // 60) if expected_min is not None else None,
-        otj_overall_progress_text,  # ProgressVariance
+        otj_progress_variance,  # ProgressVariance
         otj_overall_variance,  # Progress-Hours
+        otj_target,  # Target
         otj_status,  # OTJHoursStatus
         total_target_ksb,  # TotalTargetKSB
         total_completed_ksb,  # TotalCompletedKSB
@@ -416,7 +428,7 @@ def _map_user(u):
 INSERT_SQL = """
 INSERT INTO "LMS"."Aptem_users" (
     "ID", "FullName", "Email", "Minimum", "Planned", "Submitted", "Completed",
-    "Forecast", "Exepected", "ProgressVariance", "Progress-Hours", "OTJHoursStatus",
+    "Forecast", "Exepected", "ProgressVariance", "Progress-Hours", "Target", "OTJHoursStatus",
     "TotalTargetKSB", "TotalCompletedKSB", "KSBStatus", "Start-Date", "End-Date",
     "Total Days", "Elapsed-Days", "Program Name", "Program-Status", "Price",
     "TotalCompCount", "TargetCompCount", "CompletedCompCount", "TargetComp%%",
@@ -442,6 +454,7 @@ ON CONFLICT ("ID") DO UPDATE SET
     "Exepected" = EXCLUDED."Exepected",
     "ProgressVariance" = EXCLUDED."ProgressVariance",
     "Progress-Hours" = EXCLUDED."Progress-Hours",
+    "Target" = EXCLUDED."Target",
     "OTJHoursStatus" = EXCLUDED."OTJHoursStatus",
     "TotalTargetKSB" = EXCLUDED."TotalTargetKSB",
     "TotalCompletedKSB" = EXCLUDED."TotalCompletedKSB",
