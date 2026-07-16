@@ -52,7 +52,8 @@ EXPAND_URL = (
 # LearningPlanComponents entity set, fetched once and aggregated by LearnerId.
 COMPONENTS_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/LearningPlanComponents"
-    "?$select=LearnerId,ComponentName,ComponentType,Status,ActualHours"
+    "?$select=LearnerId,ComponentName,ComponentType,Status,"
+    "PlannedHours,ActualHours,CreatedDate,DueDate"
 )
 
 USER_GROUPS_URL = (
@@ -101,10 +102,14 @@ _COLLECTION_FIELDS = (
 _KSB_COMPLETED_STATUSES = {"Completed", "QAVerified", "QACompleted"}
 
 
-def _aggregate_components():
+def _aggregate_components(user_id=None):
     """Fetch all LearningPlanComponents once and aggregate per LearnerId into
-    component names, completed counts and actual hours per evidence bucket."""
-    rows = _fetch_paged(COMPONENTS_URL, timeout=180)
+    component names, completed counts and actual hours per evidence bucket.
+    When user_id is given, only that learner's components are fetched."""
+    url = COMPONENTS_URL
+    if user_id is not None:
+        url += f"&$filter=LearnerId eq {user_id}"
+    rows = _fetch_paged(url, timeout=180)
     by_learner = {}
     for c in rows:
         lid = c.get("LearnerId")
@@ -121,7 +126,10 @@ def _aggregate_components():
                 "name": c.get("ComponentName"),
                 "type": c.get("ComponentType"),
                 "status": c.get("Status"),
-                "hours": c.get("ActualHours"),
+                "hours": c.get("ActualHours"),  # kept for back-compat (= actual hours)
+                "planned_hours": c.get("PlannedHours"),
+                "start_date": (c.get("CreatedDate") or "")[:10] or None,
+                "end_date": (c.get("DueDate") or "")[:10] or None,
             })
         bucket = _COMPONENT_CATEGORY.get(c.get("ComponentType"))
         if bucket and c.get("Status") == "Completed":
@@ -181,15 +189,23 @@ def _fetch_user_group_names():
     }
 
 
-def _fetch_all_users():
-    users = _fetch_paged(API_URL)
+def _fetch_all_users(user_id=None):
+    """Fetch and assemble all learner records. When user_id is given, every
+    pass is scoped to that single learner so only one record is returned."""
+    api_url, expand_url = API_URL, EXPAND_URL
+    if user_id is not None:
+        # Both list URLs already carry a $filter, so AND the Id condition on.
+        api_url += f" and Id eq {user_id}"
+        expand_url += f" and Id eq {user_id}"
+
+    users = _fetch_paged(api_url)
 
     # Second pass: sub-programmes and markers, keyed on Id.
-    expanded = _fetch_paged(EXPAND_URL, timeout=180)
+    expanded = _fetch_paged(expand_url, timeout=180)
     collections_by_id = {row.get("Id"): row for row in expanded}
 
     # Third pass: per-component aggregates from LearningPlanComponents.
-    components_by_id = _aggregate_components()
+    components_by_id = _aggregate_components(user_id)
 
     # Fourth pass: case owner details, looked up by OwnerId.
     owner_ids = {u.get("UserPersonalDetails_OwnerId") for u in users}
@@ -268,6 +284,58 @@ def _map_user(u):
     agg = u.get("_components_agg") or {}
     component_list = agg.get("components", [])
     component_names = json.dumps(component_list) if component_list else None
+
+    # --- Target: "target hours for the past period, excluding the current month",
+    #     mirroring the Aptem dashboard's Off-The-Job "Target" figure.
+    #
+    #     Aptem prorates the learner's total PlannedHours linearly across the
+    #     programme timeline (StartDate -> PlannedEndDate, which is the Gateway
+    #     date, NOT the later apprenticeship end), giving a "target up to today":
+    #         target_today = PlannedHours * (start->today) / (start->gateway)   (capped at 100%)
+    #     Then it subtracts the FULL current month's planned hours (sum of
+    #     PlannedHours for components whose DueDate falls in the current month):
+    #         Target = target_today - current_month_planned
+    #     e.g. learner 1779: 341h31m up-to-today - 25h (July) = 316h31m -> "316h 31m".
+    _t_start = u.get("UserProgram_StartDate")
+    _t_gateway = u.get("UserProgram_PlannedEndDate")
+    _t_planned = safe_numeric(u.get("UserILRSummary_PlannedHours")) or 0.0
+    _t_today = datetime.date.today()
+    try:
+        _t_start_d = datetime.date.fromisoformat(_t_start[:10]) if _t_start else None
+        _t_gateway_d = datetime.date.fromisoformat(_t_gateway[:10]) if _t_gateway else None
+    except (ValueError, TypeError):
+        _t_start_d = _t_gateway_d = None
+
+    if _t_start_d and _t_gateway_d and _t_gateway_d > _t_start_d:
+        _t_total_days = (_t_gateway_d - _t_start_d).days
+        _t_elapsed_days = max((_t_today - _t_start_d).days, 0)
+        _t_ratio = min(_t_elapsed_days / _t_total_days, 1.0)
+        _t_target_today = _t_planned * _t_ratio
+
+        # Full current-month planned hours (by component DueDate = end_date).
+        _t_current_month_planned = 0.0
+        for c in component_list:
+            end_date = c.get("end_date")
+            if not end_date:
+                continue
+            try:
+                d = datetime.date.fromisoformat(end_date)
+            except (ValueError, TypeError):
+                continue
+            if d.year == _t_today.year and d.month == _t_today.month:
+                _t_current_month_planned += c.get("planned_hours") or 0
+
+        _t_target_hours = _t_target_today - _t_current_month_planned
+        if _t_target_hours < 0:
+            _t_target_hours = 0.0
+        _t_h = int(_t_target_hours)
+        _t_m = round((_t_target_hours - _t_h) * 60)
+        if _t_m == 60:  # carry when minutes round up to a full hour
+            _t_h += 1
+            _t_m = 0
+        component_target = f"{_t_h}h {_t_m}m"
+    else:
+        component_target = None
     assignment_evd = agg.get("assignment_cnt") or 0
     assignment_hrs = round(agg.get("assignment_hrs", 0.0), 2) or None
     lms_evd = agg.get("lms_cnt") or 0
@@ -367,7 +435,7 @@ def _map_user(u):
         int(expected_min // 60) if expected_min is not None else None,
         otj_progress_variance,  # ProgressVariance
         otj_overall_variance,  # Progress-Hours
-        otj_target,  # Target
+        component_target,  # Target (sum of PlannedHours for components due in previous months)
         otj_status,  # OTJHoursStatus
         total_target_ksb,  # TotalTargetKSB
         total_completed_ksb,  # TotalCompletedKSB
@@ -509,15 +577,19 @@ ON CONFLICT ("ID") DO UPDATE SET
 """
 
 
-def run_sync():
-    """Fetch all users from Aptem, upsert them, and delete any rows in the
-    table whose Id was NOT returned by the API this run. Returns the counts.
+def run_sync(user_id=None):
+    """Fetch users from Aptem, upsert them, and delete any rows in the table
+    whose Id was NOT returned by the API this run. Returns the counts.
+
+    When user_id is given, only that single learner is fetched and upserted,
+    and the delete step is skipped (so a single-user sync never removes the
+    rest of the table).
 
     Raised exceptions propagate to the caller. As a safety guard, if the API
     returns no users at all (e.g. a transient failure) the table is left
     untouched rather than wiping every row.
     """
-    users = _fetch_all_users()
+    users = _fetch_all_users(user_id)
     rows = [_map_user(u) for u in users]
     current_ids = [r[0] for r in rows]  # r[0] is the Id (first tuple element)
 
@@ -526,11 +598,12 @@ def run_sync():
         with conn.cursor() as cur:
             if rows:
                 execute_values(cur, INSERT_SQL, rows)
-            # Remove learners no longer returned by the endpoint. Skip when the
-            # fetch came back empty so an API hiccup never empties the table.
+            # Remove learners no longer returned by the endpoint. Skip for a
+            # single-user sync, and when the fetch came back empty so an API
+            # hiccup never empties the table.
             deleted = 0
             deleted_emails = []
-            if current_ids:
+            if current_ids and user_id is None:
                 cur.execute(
                     'SELECT "Email" FROM "LMS"."Aptem_users" WHERE "ID" <> ALL(%s)',
                     (current_ids,),
@@ -555,6 +628,43 @@ def sync_aptem_users(_request):
     try:
         result = run_sync()
         return JsonResponse({"status": "ok", **result})
+    except requests.HTTPError as e:
+        return JsonResponse({"status": "error", "detail": f"Aptem API error: {e}"}, status=502)
+    except Exception as e:
+        return JsonResponse({"status": "error", "detail": str(e)}, status=500)
+
+
+def _fetch_user_row(user_id):
+    """Read a single learner row from the table as a {column: value} dict,
+    or None if no such row exists."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT * FROM "LMS"."Aptem_users" WHERE "ID" = %s', (user_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            columns = [desc[0] for desc in cur.description]
+            return dict(zip(columns, row))
+    finally:
+        conn.close()
+
+
+def sync_aptem_user(_request, user_id):
+    """Sync a single learner by Aptem Id (does not touch any other rows) and
+    return that learner's full record from the table."""
+    try:
+        result = run_sync(user_id=user_id)
+        if result["upserted"] == 0:
+            return JsonResponse(
+                {"status": "error", "detail": f"No user found with Id {user_id}"},
+                status=404,
+            )
+        user = _fetch_user_row(user_id)
+        return JsonResponse(
+            {"status": "ok", "user": user},
+            json_dumps_params={"default": str, "ensure_ascii": False},
+        )
     except requests.HTTPError as e:
         return JsonResponse({"status": "error", "detail": f"Aptem API error: {e}"}, status=502)
     except Exception as e:
