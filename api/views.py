@@ -285,21 +285,23 @@ def _map_user(u):
     component_list = agg.get("components", [])
     component_names = json.dumps(component_list) if component_list else None
 
-    # --- Target: "target hours for the past period, excluding the current month",
-    #     mirroring the Aptem dashboard's Off-The-Job "Target" figure.
+    # --- Target: "target hours for the past period, up to the end of last
+    #     month (the current month is excluded)".
     #
     #     Aptem prorates the learner's total PlannedHours linearly across the
-    #     programme timeline (StartDate -> PlannedEndDate, which is the Gateway
-    #     date, NOT the later apprenticeship end), giving a "target up to today":
-    #         target_today = PlannedHours * (start->today) / (start->gateway)   (capped at 100%)
-    #     Then it subtracts the FULL current month's planned hours (sum of
-    #     PlannedHours for components whose DueDate falls in the current month):
-    #         Target = target_today - current_month_planned
-    #     e.g. learner 1779: 341h31m up-to-today - 25h (July) = 316h31m -> "316h 31m".
+    #     programme timeline: StartDate -> PlannedEndDate (which is the Gateway
+    #     date, NOT the later apprenticeship end). Its dashboard "Target up to
+    #     today" = PlannedHours * (start->today) / (start->gateway), verified to
+    #     the minute (learner 1779 -> 341h31m, learner 4609 -> 53h31m).
+    #
+    #     We want the target through the END of last month, so we prorate up to
+    #     the 1st of the current month instead of today:
+    #         Target = PlannedHours * (start -> 1st of current month) / (start->gateway)
+    #     capped to [0, PlannedHours]. e.g. 1779 -> 329h53m, 4609 -> 39h26m.
     _t_start = u.get("UserProgram_StartDate")
     _t_gateway = u.get("UserProgram_PlannedEndDate")
     _t_planned = safe_numeric(u.get("UserILRSummary_PlannedHours")) or 0.0
-    _t_today = datetime.date.today()
+    _t_month_start = datetime.date.today().replace(day=1)
     try:
         _t_start_d = datetime.date.fromisoformat(_t_start[:10]) if _t_start else None
         _t_gateway_d = datetime.date.fromisoformat(_t_gateway[:10]) if _t_gateway else None
@@ -308,26 +310,13 @@ def _map_user(u):
 
     if _t_start_d and _t_gateway_d and _t_gateway_d > _t_start_d:
         _t_total_days = (_t_gateway_d - _t_start_d).days
-        _t_elapsed_days = max((_t_today - _t_start_d).days, 0)
+        # Days elapsed from start to the 1st of the current month (>= 0), so the
+        # current month contributes nothing. Never count past the gateway.
+        _t_cutoff = min(_t_month_start, _t_gateway_d)
+        _t_elapsed_days = max((_t_cutoff - _t_start_d).days, 0)
         _t_ratio = min(_t_elapsed_days / _t_total_days, 1.0)
-        _t_target_today = _t_planned * _t_ratio
+        _t_target_hours = _t_planned * _t_ratio
 
-        # Full current-month planned hours (by component DueDate = end_date).
-        _t_current_month_planned = 0.0
-        for c in component_list:
-            end_date = c.get("end_date")
-            if not end_date:
-                continue
-            try:
-                d = datetime.date.fromisoformat(end_date)
-            except (ValueError, TypeError):
-                continue
-            if d.year == _t_today.year and d.month == _t_today.month:
-                _t_current_month_planned += c.get("planned_hours") or 0
-
-        _t_target_hours = _t_target_today - _t_current_month_planned
-        if _t_target_hours < 0:
-            _t_target_hours = 0.0
         _t_h = int(_t_target_hours)
         _t_m = round((_t_target_hours - _t_h) * 60)
         if _t_m == 60:  # carry when minutes round up to a full hour
