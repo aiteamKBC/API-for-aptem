@@ -323,8 +323,10 @@ def _map_user(u):
             _t_h += 1
             _t_m = 0
         component_target = f"{_t_h}h {_t_m}m"
+        target_hours_num = _t_target_hours  # numeric Target (hours), reused below
     else:
         component_target = None
+        target_hours_num = None
     assignment_evd = agg.get("assignment_cnt") or 0
     assignment_hrs = round(agg.get("assignment_hrs", 0.0), 2) or None
     lms_evd = agg.get("lms_cnt") or 0
@@ -365,39 +367,25 @@ def _map_user(u):
     forecast_min = safe_numeric(u.get("UserLearningPlanSummary_ForecastTime"))
     expected_min = safe_numeric(u.get("UserLearningPlanSummary_ExpectedOffTheJobHours"))
 
-    # --- OTJ hours progress (mirrors Hours_formating.js logic) ---
-    planned_hours = safe_numeric(u.get("UserILRSummary_PlannedHours"))
-    _planned_h = planned_hours or 0.0
+    # --- OTJ hours progress, both derived from the Target column above
+    #     (target_hours_num = the end-of-last-month prorated target hours):
+    #         Progress-Hours   = Completed - Target        (formatted "Xh Ym")
+    #         ProgressVariance = (Completed - Target) / Target   (signed percent)
     _completed_h = (completed_min or 0.0) / 60.0
-    _target_ratio = (
-        min(elapsed_days, total_days) / total_days
-        if total_days and total_days > 0 and elapsed_days is not None
-        else None
-    )
-    if _target_ratio is not None:
-        _target_min = _planned_h * 60.0 * _target_ratio
-        _variance_min = round((completed_min or 0.0) - _target_min)
+    if target_hours_num is not None:
+        _variance_min = round((_completed_h - target_hours_num) * 60.0)
         _sign = "-" if _variance_min < 0 else ""
         _abs = abs(_variance_min)
         otj_overall_variance = f"{_sign}{_abs // 60}h {_abs % 60}m"
 
-        # Target = Completed - (Progress-Hours): the on-track OTJ target hours,
-        # formatted "Xh Ym" to mirror the Progress-Hours column.
-        _target_total_min = round(_target_min)
-        otj_target = f"{_target_total_min // 60}h {_target_total_min % 60}m"
-
-        # ProgressVariance = (Completed - Target) / Target, as a signed percent
-        # with one decimal place.
-        _target_hours = _target_min / 60.0
-        if _target_hours:
-            _progress_variance_pct = ((_completed_h - _target_hours) / _target_hours) * 100
+        if target_hours_num:
+            _progress_variance_pct = ((_completed_h - target_hours_num) / target_hours_num) * 100
             otj_progress_variance = f"{_progress_variance_pct:.1f}%"
         else:
             _progress_variance_pct = None
             otj_progress_variance = None
     else:
         otj_overall_variance = None
-        otj_target = None
         otj_progress_variance = None
         _progress_variance_pct = None
 
@@ -424,7 +412,7 @@ def _map_user(u):
         int(expected_min // 60) if expected_min is not None else None,
         otj_progress_variance,  # ProgressVariance
         otj_overall_variance,  # Progress-Hours
-        component_target,  # Target (sum of PlannedHours for components due in previous months)
+        component_target,  # Target (prorated planned hours through end of last month)
         otj_status,  # OTJHoursStatus
         total_target_ksb,  # TotalTargetKSB
         total_completed_ksb,  # TotalCompletedKSB
