@@ -3,7 +3,7 @@ import json
 import datetime
 import requests
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values, Json
 from django.http import JsonResponse
 from dotenv import load_dotenv
 
@@ -19,6 +19,7 @@ API_URL = (
     "UserLearningPlanSummary_CompletedTime,UserLearningPlanSummary_ForecastTime,"
     "UserLearningPlanSummary_ExpectedOffTheJobHours,UserProgram_StartDate,"
     "UserProgram_PlannedEndDate,UserILRSummary_PrimaryHealthProblem,"
+    "UserProgram_ProgramId,"
     "UserProgram_CurrentProgramme,UserProgram_Status,SubscriptionStatus,"
     "UserReviews_ADET_GRModel_rag,UserILRSummary_TNPSum,UserPersonalDetails_Gender,"
     "UserPersonalDetails_Address,UserPersonalDetails_PostCode,UserPersonalDetails_Mobile,"
@@ -52,7 +53,7 @@ EXPAND_URL = (
 # LearningPlanComponents entity set, fetched once and aggregated by LearnerId.
 COMPONENTS_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/LearningPlanComponents"
-    "?$select=LearnerId,ComponentName,ComponentType,Status,"
+    "?$select=LearnerId,ProgramId,ComponentName,ComponentType,Status,"
     "PlannedHours,ActualHours,CreatedDate,DueDate"
 )
 
@@ -103,19 +104,22 @@ _KSB_COMPLETED_STATUSES = {"Completed", "QAVerified", "QACompleted"}
 
 
 def _aggregate_components(user_id=None):
-    """Fetch all LearningPlanComponents once and aggregate per LearnerId into
-    component names, completed counts and actual hours per evidence bucket.
+    """Fetch all LearningPlanComponents once and aggregate into component names,
+    completed counts and actual hours per evidence bucket, keyed by
+    (LearnerId, ProgramId). A learner can have components from several
+    programmes (e.g. an old withdrawn programme plus the current one); keying on
+    the programme lets the caller keep only the learner's CURRENT programme.
     When user_id is given, only that learner's components are fetched."""
     url = COMPONENTS_URL
     if user_id is not None:
         url += f"&$filter=LearnerId eq {user_id}"
     rows = _fetch_paged(url, timeout=180)
-    by_learner = {}
+    by_learner_program = {}
     for c in rows:
-        lid = c.get("LearnerId")
-        agg = by_learner.get(lid)
+        key = (c.get("LearnerId"), c.get("ProgramId"))
+        agg = by_learner_program.get(key)
         if agg is None:
-            agg = by_learner[lid] = {
+            agg = by_learner_program[key] = {
                 "components": [],
                 "assignment_cnt": 0, "assignment_hrs": 0.0,
                 "lms_cnt": 0, "lms_hrs": 0.0,
@@ -138,7 +142,7 @@ def _aggregate_components(user_id=None):
                 agg[f"{bucket}_hrs"] += float(c.get("ActualHours") or 0)
             except (ValueError, TypeError):
                 pass
-    return by_learner
+    return by_learner_program
 
 
 def _fetch_owners(owner_ids):
@@ -219,7 +223,12 @@ def _fetch_all_users(user_id=None):
         extra = collections_by_id.get(uid, {})
         for field in _COLLECTION_FIELDS:
             user[field] = extra.get(field, [])
-        user["_components_agg"] = components_by_id.get(uid)
+        # Keep only the learner's CURRENT programme's components; a withdrawn
+        # programme's components share the same LearnerId but a different
+        # ProgramId and must not leak into the target / component list.
+        user["_components_agg"] = components_by_id.get(
+            (uid, user.get("UserProgram_ProgramId"))
+        )
         user["_owner"] = owners_by_id.get(user.get("UserPersonalDetails_OwnerId"))
         user["_group_name"] = group_names_by_user_id.get(uid)
 
@@ -285,38 +294,25 @@ def _map_user(u):
     component_list = agg.get("components", [])
     component_names = json.dumps(component_list) if component_list else None
 
-    # --- Target: "target hours for the past period, up to the end of last
-    #     month (the current month is excluded)".
-    #
-    #     Aptem prorates the learner's total PlannedHours linearly across the
-    #     programme timeline: StartDate -> PlannedEndDate (which is the Gateway
-    #     date, NOT the later apprenticeship end). Its dashboard "Target up to
-    #     today" = PlannedHours * (start->today) / (start->gateway), verified to
-    #     the minute (learner 1779 -> 341h31m, learner 4609 -> 53h31m).
-    #
-    #     We want the target through the END of last month, so we prorate up to
-    #     the 1st of the current month instead of today:
-    #         Target = PlannedHours * (start -> 1st of current month) / (start->gateway)
-    #     capped to [0, PlannedHours]. e.g. 1779 -> 329h53m, 4609 -> 39h26m.
-    _t_start = u.get("UserProgram_StartDate")
-    _t_gateway = u.get("UserProgram_PlannedEndDate")
-    _t_planned = safe_numeric(u.get("UserILRSummary_PlannedHours")) or 0.0
+    # --- Target: sum of PlannedHours for all components due (DueDate = end_date)
+    #     before the 1st of the current month, i.e. everything scheduled for the
+    #     completed past months. Null PlannedHours (Reviews, EPA, ...) count as 0;
+    #     components with no DueDate are excluded from the sum. This is the "target
+    #     hours for the past period, excluding the current month".
+    #     e.g. learner 17045 (run in July) -> 1 + 21 + 10 = 32h -> "32h 0m".
     _t_month_start = datetime.date.today().replace(day=1)
-    try:
-        _t_start_d = datetime.date.fromisoformat(_t_start[:10]) if _t_start else None
-        _t_gateway_d = datetime.date.fromisoformat(_t_gateway[:10]) if _t_gateway else None
-    except (ValueError, TypeError):
-        _t_start_d = _t_gateway_d = None
+    _t_target_hours = 0.0
+    for c in component_list:
+        end_date = c.get("end_date")
+        if not end_date:
+            continue
+        try:
+            if datetime.date.fromisoformat(end_date) < _t_month_start:
+                _t_target_hours += c.get("planned_hours") or 0
+        except (ValueError, TypeError):
+            continue
 
-    if _t_start_d and _t_gateway_d and _t_gateway_d > _t_start_d:
-        _t_total_days = (_t_gateway_d - _t_start_d).days
-        # Days elapsed from start to the 1st of the current month (>= 0), so the
-        # current month contributes nothing. Never count past the gateway.
-        _t_cutoff = min(_t_month_start, _t_gateway_d)
-        _t_elapsed_days = max((_t_cutoff - _t_start_d).days, 0)
-        _t_ratio = min(_t_elapsed_days / _t_total_days, 1.0)
-        _t_target_hours = _t_planned * _t_ratio
-
+    if component_list:
         _t_h = int(_t_target_hours)
         _t_m = round((_t_target_hours - _t_h) * 60)
         if _t_m == 60:  # carry when minutes round up to a full hour
@@ -460,7 +456,8 @@ def _map_user(u):
         u.get("UserPersonalDetails_Address"),
         u.get("UserPersonalDetails_PostCode"),
         marker_names,  # Markers_Markers
-        component_names,  # components
+        component_names,  # components (JSON as text, kept for back-compat)
+        Json(component_list) if component_list else None,  # components_json (native json)
         u.get("UserEmployer_ManagerEmail"),
         str(u.get("UserILRSummary_EmploymentWeeklyHours"))
         if u.get("UserILRSummary_EmploymentWeeklyHours") is not None else None,  # Working hours
@@ -484,7 +481,7 @@ INSERT INTO "LMS"."Aptem_users" (
     "Assignment Evidence", "AssignEvdHours", "LMS Evidence", "LMSEvdHours",
     "ExtraAct-Evidence", "ExtrEvdHours", "Group", "Disability", "case_owner_id",
     "Gender", "subprogramme", "Manager Phone", "Learner Phone", "Address",
-    "post code", "Markers_Markers", "components", "Employer Email",
+    "post code", "Markers_Markers", "components", "components_json", "Employer Email",
     "Working hours", "Subscription Status", "Levy or Not"
 )
 VALUES %s
@@ -547,6 +544,7 @@ ON CONFLICT ("ID") DO UPDATE SET
     "post code" = EXCLUDED."post code",
     "Markers_Markers" = EXCLUDED."Markers_Markers",
     "components" = EXCLUDED."components",
+    "components_json" = EXCLUDED."components_json",
     "Employer Email" = EXCLUDED."Employer Email",
     "Working hours" = EXCLUDED."Working hours",
     "Subscription Status" = EXCLUDED."Subscription Status",
@@ -605,6 +603,93 @@ def sync_aptem_users(_request):
     try:
         result = run_sync()
         return JsonResponse({"status": "ok", **result})
+    except requests.HTTPError as e:
+        return JsonResponse({"status": "error", "detail": f"Aptem API error: {e}"}, status=502)
+    except Exception as e:
+        return JsonResponse({"status": "error", "detail": str(e)}, status=500)
+
+
+# Programme-related fields on the users entity ($metadata.xml: UserProgram_* /
+# Programme_* properties). Fetched live from Aptem for the programme-info URL.
+PROGRAMME_INFO_URL = (
+    "https://kentbusinesscollege.aptem.co.uk/odata/1.0/users"
+    "?$select=Id,FullName,Email,"
+    "UserProgram_ProgramId,UserProgram_CurrentProgramme,"
+    "UserProgram_CurrentProgrammeType,UserProgram_Status,"
+    "UserProgram_StartDate,UserProgram_PlannedEndDate,"
+    "UserProgram_CompletedDate,UserProgram_LeavingDate,"
+    "UserProgram_ApprenticeshipStartDate,UserProgram_DeliveryType,"
+    "UserProgram_RecognisedPriorLearningHours,UserProgram_OnboardingStatus,"
+    "UserProgram_TargetProgramId,UserProgram_TargetProgramName,"
+    "UserProgram_Tags,Programme_PlannedWeeklyHours,"
+    "Programme_LastPlanReviewDate,Programme_HasEligibilityIssues,"
+    "Programme_ExpectedEndDate,Programme_DeliveryType"
+    "&$filter=UserProgram_Status ne null and SubscriptionStatus eq 'FullUser'"
+)
+
+# As with EXPAND_URL above, sub-programmes only populate via $expand and the
+# server rejects a long $select combined with $expand, so second pass on Id.
+PROGRAMME_EXPAND_URL = (
+    "https://kentbusinesscollege.aptem.co.uk/odata/1.0/users"
+    "?$select=Id"
+    "&$expand=UserProgram_SubPrograms"
+    "&$filter=UserProgram_Status ne null and SubscriptionStatus eq 'FullUser'"
+)
+
+
+def _fetch_programme_info(lookup_id=None):
+    """Fetch programme info straight from the Aptem OData users endpoint,
+    merging in sub-programmes. lookup_id matches either the learner Id or
+    the programme id (UserProgram_ProgramId), so /programme-info/<id>/ works
+    with both; a programme id can match several learners."""
+    info_url, expand_url = PROGRAMME_INFO_URL, PROGRAMME_EXPAND_URL
+    if lookup_id is not None:
+        condition = f" and (Id eq {lookup_id} or UserProgram_ProgramId eq {lookup_id})"
+        info_url += condition
+        expand_url += condition
+
+    users = _fetch_paged(info_url)
+    expanded = _fetch_paged(expand_url, timeout=180)
+    subprograms_by_id = {
+        row.get("Id"): row.get("UserProgram_SubPrograms") or []
+        for row in expanded
+    }
+    for user in users:
+        user.pop("@odata.etag", None)
+        user["UserProgram_SubPrograms"] = subprograms_by_id.get(user.get("Id"), [])
+    return users
+
+
+def programme_info(_request):
+    """Return programme info for every active learner, live from Aptem."""
+    try:
+        users = _fetch_programme_info()
+        return JsonResponse(
+            {"status": "ok", "count": len(users), "users": users},
+            json_dumps_params={"default": str, "ensure_ascii": False},
+        )
+    except requests.HTTPError as e:
+        return JsonResponse({"status": "error", "detail": f"Aptem API error: {e}"}, status=502)
+    except Exception as e:
+        return JsonResponse({"status": "error", "detail": str(e)}, status=500)
+
+
+def programme_info_user(_request, user_id):
+    """Return programme info by learner Id or programme id, live from Aptem.
+    A learner Id yields one record; a programme id yields every learner on
+    that programme (both cases are in the "users" list, first one in "user")."""
+    try:
+        users = _fetch_programme_info(user_id)
+        if not users:
+            return JsonResponse(
+                {"status": "error",
+                 "detail": f"No user or programme found with Id {user_id}"},
+                status=404,
+            )
+        return JsonResponse(
+            {"status": "ok", "count": len(users), "user": users[0], "users": users},
+            json_dumps_params={"default": str, "ensure_ascii": False},
+        )
     except requests.HTTPError as e:
         return JsonResponse({"status": "error", "detail": f"Aptem API error: {e}"}, status=502)
     except Exception as e:
