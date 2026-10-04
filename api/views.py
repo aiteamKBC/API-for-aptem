@@ -36,7 +36,8 @@ API_URL = (
     "ComplianceDocuments_ADET_GRModel_contractforservice,"
     "ComplianceDocuments_ADET_GRModel_writtenagreement,UserGroups_GroupLevel0,"
     "UserILRSummary_EmploymentWeeklyHours,UserEmployer_LevyPayer"
-    "&$filter=UserProgram_Status ne null and SubscriptionStatus eq 'FullUser'"
+    "&$filter=(UserProgram_Status eq 'Active' or UserProgram_Status eq 'OnBreak')"
+    " and SubscriptionStatus eq 'FullUser'"
 )
 
 # Sub-programmes and markers only populate via $expand, and the server rejects
@@ -46,7 +47,8 @@ EXPAND_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/users"
     "?$select=Id"
     "&$expand=UserProgram_SubPrograms,Markers_Markers,UserComponents_Components"
-    "&$filter=UserProgram_Status ne null and SubscriptionStatus eq 'FullUser'"
+    "&$filter=(UserProgram_Status eq 'Active' or UserProgram_Status eq 'OnBreak')"
+    " and SubscriptionStatus eq 'FullUser'"
 )
 
 # Per-component detail (names, type, status, hours) comes from the
@@ -65,6 +67,13 @@ USER_GROUPS_URL = (
 GROUPS_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/Groups"
     "?$select=Id,Name"
+)
+
+# Employer phone lives on the Organizations entity; users link to it via
+# UserEmployer_EmployerId.
+ORGANIZATIONS_URL = (
+    "https://kentbusinesscollege.aptem.co.uk/odata/1.0/Organizations"
+    "?$select=Id,ContactPhone"
 )
 
 # Map a LearningPlanComponent ComponentType to one of our evidence buckets.
@@ -193,6 +202,14 @@ def _fetch_user_group_names():
     }
 
 
+def _fetch_employer_phones():
+    """Map Organization Id -> ContactPhone."""
+    return {
+        row.get("Id"): row.get("ContactPhone")
+        for row in _fetch_paged(ORGANIZATIONS_URL, timeout=180)
+    }
+
+
 def _fetch_all_users(user_id=None):
     """Fetch and assemble all learner records. When user_id is given, every
     pass is scoped to that single learner so only one record is returned."""
@@ -218,6 +235,9 @@ def _fetch_all_users(user_id=None):
     # Fifth pass: user group names, using the same highest-GroupId rule as n8n.
     group_names_by_user_id = _fetch_user_group_names()
 
+    # Sixth pass: employer phone numbers, looked up by EmployerId.
+    employer_phones = _fetch_employer_phones()
+
     for user in users:
         uid = user.get("Id")
         extra = collections_by_id.get(uid, {})
@@ -231,6 +251,7 @@ def _fetch_all_users(user_id=None):
         )
         user["_owner"] = owners_by_id.get(user.get("UserPersonalDetails_OwnerId"))
         user["_group_name"] = group_names_by_user_id.get(uid)
+        user["_employer_phone"] = employer_phones.get(user.get("UserEmployer_EmployerId"))
 
     return users
 
@@ -464,6 +485,7 @@ def _map_user(u):
         u.get("SubscriptionStatus"),
         "Levy" if u.get("UserEmployer_LevyPayer") is True
         else ("Non-Levy" if u.get("UserEmployer_LevyPayer") is False else None),  # Levy or Not
+        u.get("_employer_phone"),  # Organization Phone (Organizations.ContactPhone)
     )
 
 
@@ -482,7 +504,7 @@ INSERT INTO "LMS"."Aptem_users" (
     "ExtraAct-Evidence", "ExtrEvdHours", "Group", "Disability", "case_owner_id",
     "Gender", "subprogramme", "Manager Phone", "Learner Phone", "Address",
     "post code", "Markers_Markers", "components", "components_json", "Employer Email",
-    "Working hours", "Subscription Status", "Levy or Not"
+    "Working hours", "Subscription Status", "Levy or Not", "Organization Phone"
 )
 VALUES %s
 ON CONFLICT ("ID") DO UPDATE SET
@@ -548,7 +570,8 @@ ON CONFLICT ("ID") DO UPDATE SET
     "Employer Email" = EXCLUDED."Employer Email",
     "Working hours" = EXCLUDED."Working hours",
     "Subscription Status" = EXCLUDED."Subscription Status",
-    "Levy or Not" = EXCLUDED."Levy or Not"
+    "Levy or Not" = EXCLUDED."Levy or Not",
+    "Organization Phone" = EXCLUDED."Organization Phone"
 """
 
 

@@ -130,4 +130,6 @@ Thumbs.db
 sheets-api.json
 components-api-479208-93bb0f2fc896.json
 
-$metadata.xml
+$metadata 3.xml
+
+/api/__pycache__/
