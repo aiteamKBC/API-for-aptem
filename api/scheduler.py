@@ -15,7 +15,7 @@ _scheduler = None
 
 def _job():
     # Imported lazily so this module is safe to import before apps are ready.
-    from api.views import run_sync
+    from api.views import run_sync, run_non_active_sync
     from api.mcr_views import run_sync as run_mcr_sync
     from api.pr_views import run_sync as run_pr_sync
 
@@ -25,6 +25,13 @@ def _job():
                     result["upserted"], result["deleted"])
     except Exception:
         logger.exception("Aptem scheduled sync failed.")
+
+    try:
+        result = run_non_active_sync()
+        logger.info("Non-active sync: upserted %s, deleted %s stale row(s).",
+                    result["upserted"], result["deleted"])
+    except Exception:
+        logger.exception("Non-active scheduled sync failed.")
 
     # MCR and PR read from the Aptem_users table the sync above populates, so
     # they run afterwards. Each is isolated so one failing does not skip the

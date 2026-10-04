@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand
 
-from api.views import run_sync
+from api.views import run_sync, run_non_active_sync
 
 
 class Command(BaseCommand):
@@ -16,3 +16,8 @@ class Command(BaseCommand):
             self.stdout.write("Deleted emails:")
             for email in result["deleted_emails"]:
                 self.stdout.write(f"  - {email}")
+
+        result = run_non_active_sync()
+        self.stdout.write(self.style.SUCCESS(
+            f"Non-active: upserted {result['upserted']}, deleted {result['deleted']} stale row(s)."
+        ))

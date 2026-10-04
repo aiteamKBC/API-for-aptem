@@ -12,6 +12,18 @@ load_dotenv()
 APTEM_TOKEN = os.getenv("aptem_X-API-Token")
 DATABASE_URL = os.getenv("database_string")
 
+# Learners are split across two tables by programme status: Active / OnBreak
+# go to Aptem_users, every other status goes to non_active_users.
+ACTIVE_FILTER = (
+    "(UserProgram_Status eq 'Active' or UserProgram_Status eq 'OnBreak')"
+    " and SubscriptionStatus eq 'FullUser'"
+)
+NON_ACTIVE_FILTER = (
+    "UserProgram_Status ne null"
+    " and UserProgram_Status ne 'Active' and UserProgram_Status ne 'OnBreak'"
+    " and SubscriptionStatus eq 'FullUser'"
+)
+
 API_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/users"
     "?$select=Id,FullName,Email,UserILRSummary_MinimumRequiredHours,"
@@ -36,8 +48,7 @@ API_URL = (
     "ComplianceDocuments_ADET_GRModel_contractforservice,"
     "ComplianceDocuments_ADET_GRModel_writtenagreement,UserGroups_GroupLevel0,"
     "UserILRSummary_EmploymentWeeklyHours,UserEmployer_LevyPayer"
-    "&$filter=(UserProgram_Status eq 'Active' or UserProgram_Status eq 'OnBreak')"
-    " and SubscriptionStatus eq 'FullUser'"
+    "&$filter="
 )
 
 # Sub-programmes and markers only populate via $expand, and the server rejects
@@ -47,8 +58,7 @@ EXPAND_URL = (
     "https://kentbusinesscollege.aptem.co.uk/odata/1.0/users"
     "?$select=Id"
     "&$expand=UserProgram_SubPrograms,Markers_Markers,UserComponents_Components"
-    "&$filter=(UserProgram_Status eq 'Active' or UserProgram_Status eq 'OnBreak')"
-    " and SubscriptionStatus eq 'FullUser'"
+    "&$filter="
 )
 
 # Per-component detail (names, type, status, hours) comes from the
@@ -210,10 +220,11 @@ def _fetch_employer_phones():
     }
 
 
-def _fetch_all_users(user_id=None):
-    """Fetch and assemble all learner records. When user_id is given, every
-    pass is scoped to that single learner so only one record is returned."""
-    api_url, expand_url = API_URL, EXPAND_URL
+def _fetch_all_users(user_id=None, status_filter=ACTIVE_FILTER):
+    """Fetch and assemble all learner records matching status_filter. When
+    user_id is given, every pass is scoped to that single learner so only one
+    record is returned."""
+    api_url, expand_url = API_URL + status_filter, EXPAND_URL + status_filter
     if user_id is not None:
         # Both list URLs already carry a $filter, so AND the Id condition on.
         api_url += f" and Id eq {user_id}"
@@ -490,7 +501,7 @@ def _map_user(u):
 
 
 INSERT_SQL = """
-INSERT INTO "LMS"."Aptem_users" (
+INSERT INTO "LMS"."{table}" (
     "ID", "FullName", "Email", "Minimum", "Planned", "Submitted", "Completed",
     "Forecast", "Exepected", "ProgressVariance", "Progress-Hours", "Target", "OTJHoursStatus",
     "TotalTargetKSB", "TotalCompletedKSB", "KSBStatus", "Start-Date", "End-Date",
@@ -575,9 +586,10 @@ ON CONFLICT ("ID") DO UPDATE SET
 """
 
 
-def run_sync(user_id=None):
-    """Fetch users from Aptem, upsert them, and delete any rows in the table
-    whose Id was NOT returned by the API this run. Returns the counts.
+def run_sync(user_id=None, table="Aptem_users", status_filter=ACTIVE_FILTER):
+    """Fetch users matching status_filter from Aptem, upsert them into
+    "LMS".<table>, and delete any rows in that table whose Id was NOT returned
+    by the API this run. Returns the counts.
 
     When user_id is given, only that single learner is fetched and upserted,
     and the delete step is skipped (so a single-user sync never removes the
@@ -587,7 +599,7 @@ def run_sync(user_id=None):
     returns no users at all (e.g. a transient failure) the table is left
     untouched rather than wiping every row.
     """
-    users = _fetch_all_users(user_id)
+    users = _fetch_all_users(user_id, status_filter)
     rows = [_map_user(u) for u in users]
     current_ids = [r[0] for r in rows]  # r[0] is the Id (first tuple element)
 
@@ -595,7 +607,7 @@ def run_sync(user_id=None):
     try:
         with conn.cursor() as cur:
             if rows:
-                execute_values(cur, INSERT_SQL, rows)
+                execute_values(cur, INSERT_SQL.replace("{table}", table), rows)
             # Remove learners no longer returned by the endpoint. Skip for a
             # single-user sync, and when the fetch came back empty so an API
             # hiccup never empties the table.
@@ -603,12 +615,12 @@ def run_sync(user_id=None):
             deleted_emails = []
             if current_ids and user_id is None:
                 cur.execute(
-                    'SELECT "Email" FROM "LMS"."Aptem_users" WHERE "ID" <> ALL(%s)',
+                    f'SELECT "Email" FROM "LMS"."{table}" WHERE "ID" <> ALL(%s)',
                     (current_ids,),
                 )
                 deleted_emails = [row[0] for row in cur.fetchall() if row[0]]
                 cur.execute(
-                    'DELETE FROM "LMS"."Aptem_users" WHERE "ID" <> ALL(%s)',
+                    f'DELETE FROM "LMS"."{table}" WHERE "ID" <> ALL(%s)',
                     (current_ids,),
                 )
                 deleted = cur.rowcount
@@ -622,9 +634,16 @@ def run_sync(user_id=None):
     return {"upserted": len(rows), "deleted": deleted, "deleted_emails": deleted_emails}
 
 
+def run_non_active_sync():
+    """Sync every learner whose programme status is NOT Active / OnBreak into
+    "LMS"."non_active_users" (same columns as Aptem_users)."""
+    return run_sync(table="non_active_users", status_filter=NON_ACTIVE_FILTER)
+
+
 def sync_aptem_users(_request):
     try:
         result = run_sync()
+        result["non_active"] = run_non_active_sync()
         return JsonResponse({"status": "ok", **result})
     except requests.HTTPError as e:
         return JsonResponse({"status": "error", "detail": f"Aptem API error: {e}"}, status=502)
